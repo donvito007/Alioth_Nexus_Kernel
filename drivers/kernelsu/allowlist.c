@@ -134,6 +134,11 @@ bool ksu_set_app_profile(struct app_profile *profile, bool persist)
 	struct list_head *pos = NULL;
 	bool result = false;
 
+	if (profile->current_uid < 2000) {
+		pr_err("uid lower than 2000 is unsupported: %d\n", profile->current_uid);
+		return false;
+	}
+
 	if (!profile_valid(profile)) {
 		pr_err("Failed to set app profile: invalid profile!\n");
 		return false;
@@ -200,6 +205,11 @@ bool __ksu_is_allow_uid(uid_t uid)
 	if (unlikely(uid == 0)) {
 		// already root, but only allow our domain.
 		return is_ksu_domain();
+	}
+
+	if (uid < 2000) {
+		// do not bother going through the list if it's system
+		return false;
 	}
 
 	list_for_each (pos, &allow_list) {
