@@ -51,6 +51,9 @@ struct perm_data {
 
 static struct list_head allow_list;
 
+static uint8_t allow_list_bitmap[PAGE_SIZE] __read_mostly __aligned(PAGE_SIZE);
+#define BITMAP_UID_MAX ((sizeof(allow_list_bitmap) * BITS_PER_BYTE) - 1)
+
 #define KERNEL_SU_ALLOWLIST "/data/adb/ksu/.allowlist"
 
 static struct work_struct ksu_save_work;
@@ -150,9 +153,7 @@ bool ksu_set_app_profile(struct app_profile *profile, bool persist)
 		if (profile->current_uid == p->profile.current_uid &&
 		    !strcmp(profile->key, p->profile.key)) {
 			// found it, just override it all!
-			memcpy(&p->profile, profile, sizeof(*profile));
-			result = true;
-			goto exit;
+			goto out;
 		}
 	}
 
@@ -175,9 +176,17 @@ bool ksu_set_app_profile(struct app_profile *profile, bool persist)
 			profile->nrp_config.profile.umount_modules);
 	}
 	list_add_tail(&p->list, &allow_list);
+
+out:
+	if (uid <= BITMAP_UID_MAX) {
+		if (allow)
+			allow_list_bitmap[uid / BITS_PER_BYTE] |= 1 << (uid % BITS_PER_BYTE);
+		else
+			allow_list_bitmap[uid / BITS_PER_BYTE] &= ~(1 << (uid % BITS_PER_BYTE));
+		smp_mb();
+	}
 	result = true;
 
-exit:
 	// check if the default profiles is changed, cache it to a single struct to accelerate access.
 	if (unlikely(!strcmp(profile->key, "$"))) {
 		// set default non root profile
@@ -212,11 +221,15 @@ bool __ksu_is_allow_uid(uid_t uid)
 		return false;
 	}
 
-	list_for_each (pos, &allow_list) {
-		p = list_entry(pos, struct perm_data, list);
-		// pr_info("is_allow_uid uid :%d, allow: %d\n", p->uid, p->allow);
-		if (uid == p->profile.current_uid) {
-			return p->profile.allow_su;
+	if (likely(uid <= BITMAP_UID_MAX)) {
+		return !!(allow_list_bitmap[uid / BITS_PER_BYTE] & (1 << (uid % BITS_PER_BYTE)));
+	} else {
+		list_for_each (pos, &allow_list) {
+			p = list_entry(pos, struct perm_data, list);
+			// pr_info("is_allow_uid uid :%d, allow: %d\n", p->uid, p->allow);
+	                if (uid == p->profile.current_uid) {
+        	                return p->profile.allow_su;
+			}
 		}
 	}
 
@@ -396,6 +409,8 @@ void ksu_prune_allowlist(bool (*is_uid_exist)(uid_t, void *), void *data)
 			modified = true;
 			pr_info("prune uid: %d\n", uid);
 			list_del(&np->list);
+			allow_list_bitmap[uid / BITS_PER_BYTE] &= ~(1 << (uid % BITS_PER_BYTE));
+			smp_mb();
 			kfree(np);
 		}
 	}
@@ -419,6 +434,8 @@ bool ksu_load_allow_list(void)
 
 void ksu_allowlist_init(void)
 {
+	BUILD_BUG_ON(sizeof(allow_list_bitmap) != PAGE_SIZE);
+
 	INIT_LIST_HEAD(&allow_list);
 
 	INIT_WORK(&ksu_save_work, do_save_allow_list);
