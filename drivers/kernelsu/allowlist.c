@@ -54,6 +54,38 @@ static struct list_head allow_list;
 static uint8_t allow_list_bitmap[PAGE_SIZE] __read_mostly __aligned(PAGE_SIZE);
 #define BITMAP_UID_MAX ((sizeof(allow_list_bitmap) * BITS_PER_BYTE) - 1)
 
+static int allow_list_arr[PAGE_SIZE / sizeof(int)] __read_mostly __aligned(PAGE_SIZE);
+static int allow_list_pointer __read_mostly = 0;
+
+static void remove_uid_from_arr(uid_t uid)
+{
+	int *temp_arr;
+	int i, j;
+
+	if (allow_list_pointer == 0)
+		return;
+
+	temp_arr = kmalloc(sizeof(allow_list_arr), GFP_KERNEL);
+	if (temp_arr == NULL) {
+		pr_err("%s: unable to allocate memory\n", __func__);
+		return;
+	}
+
+	for (i = j = 0; i < allow_list_pointer; i++) {
+		if (allow_list_arr[i] == uid)
+			continue;
+		temp_arr[j++] = allow_list_arr[i];
+	}
+
+	allow_list_pointer = j;
+
+	for (; j < ARRAY_SIZE(allow_list_arr); j++)
+		temp_arr[j] = -1;
+
+	memcpy(&allow_list_arr, temp_arr, PAGE_SIZE);
+	kfree(temp_arr);
+}
+
 #define KERNEL_SU_ALLOWLIST "/data/adb/ksu/.allowlist"
 
 static struct work_struct ksu_save_work;
@@ -178,13 +210,28 @@ bool ksu_set_app_profile(struct app_profile *profile, bool persist)
 	list_add_tail(&p->list, &allow_list);
 
 out:
-	if (uid <= BITMAP_UID_MAX) {
-		if (allow)
-			allow_list_bitmap[uid / BITS_PER_BYTE] |= 1 << (uid % BITS_PER_BYTE);
+	if (p->profile.current_uid <= BITMAP_UID_MAX) {
+		if (p->profile.allow_su)
+			allow_list_bitmap[p->profile.current_uid / BITS_PER_BYTE] |= 1 << (p->profile.current_uid % BITS_PER_BYTE);
 		else
-			allow_list_bitmap[uid / BITS_PER_BYTE] &= ~(1 << (uid % BITS_PER_BYTE));
-		smp_mb();
+			allow_list_bitmap[p->profile.current_uid / BITS_PER_BYTE] &= ~(1 << (p->profile.current_uid % BITS_PER_BYTE));
+	} else {
+		if (p->profile.allow_su) {
+			/*
+			 * 1024 apps with uid higher than BITMAP_UID_MAX
+			 * registered to request superuser?
+			 */
+			if (allow_list_pointer >= ARRAY_SIZE(allow_list_arr)) {
+				pr_err("too many apps registered\n");
+				WARN_ON(1);
+				return false;
+			}
+			allow_list_arr[allow_list_pointer++] = p->profile.current_uid;
+		} else {
+			remove_uid_from_arr(p->profile.current_uid);
+		}
 	}
+	smp_mb();
 	result = true;
 
 	// check if the default profiles is changed, cache it to a single struct to accelerate access.
@@ -208,8 +255,7 @@ out:
 
 bool __ksu_is_allow_uid(uid_t uid)
 {
-	struct perm_data *p = NULL;
-	struct list_head *pos = NULL;
+	int i;
 
 	if (unlikely(uid == 0)) {
 		// already root, but only allow our domain.
@@ -224,12 +270,9 @@ bool __ksu_is_allow_uid(uid_t uid)
 	if (likely(uid <= BITMAP_UID_MAX)) {
 		return !!(allow_list_bitmap[uid / BITS_PER_BYTE] & (1 << (uid % BITS_PER_BYTE)));
 	} else {
-		list_for_each (pos, &allow_list) {
-			p = list_entry(pos, struct perm_data, list);
-			// pr_info("is_allow_uid uid :%d, allow: %d\n", p->uid, p->allow);
-	                if (uid == p->profile.current_uid) {
-        	                return p->profile.allow_su;
-			}
+		for (i = 0; i < allow_list_pointer; i++) {
+			if (allow_list_arr[i] == uid)
+				return true;
 		}
 	}
 
@@ -410,6 +453,7 @@ void ksu_prune_allowlist(bool (*is_uid_exist)(uid_t, void *), void *data)
 			pr_info("prune uid: %d\n", uid);
 			list_del(&np->list);
 			allow_list_bitmap[uid / BITS_PER_BYTE] &= ~(1 << (uid % BITS_PER_BYTE));
+			remove_uid_from_arr(uid);
 			smp_mb();
 			kfree(np);
 		}
@@ -434,7 +478,13 @@ bool ksu_load_allow_list(void)
 
 void ksu_allowlist_init(void)
 {
+	int i;
+
 	BUILD_BUG_ON(sizeof(allow_list_bitmap) != PAGE_SIZE);
+	BUILD_BUG_ON(sizeof(allow_list_arr) != PAGE_SIZE);
+
+	for (i = 0; i < ARRAY_SIZE(allow_list_arr); i++)
+		allow_list_arr[i] = -1;
 
 	INIT_LIST_HEAD(&allow_list);
 
