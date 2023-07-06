@@ -92,6 +92,7 @@
 DEFINE_MUTEX(module_mutex);
 EXPORT_SYMBOL_GPL(module_mutex);
 static LIST_HEAD(modules);
+extern void module_assert_mutex(void);
 
 #ifdef CONFIG_MODULES_TREE_LOOKUP
 
